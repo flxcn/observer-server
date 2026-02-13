@@ -6,6 +6,20 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Check if DATABASE_URL is set
+if (!process.env.DATABASE_URL) {
+  console.error('❌ ERROR: DATABASE_URL environment variable is not set!');
+  console.error('');
+  console.error('Please add a PostgreSQL database to your Railway project:');
+  console.error('1. Go to Railway dashboard');
+  console.error('2. Click "New" → "Database" → "PostgreSQL"');
+  console.error('3. Wait for it to provision');
+  console.error('4. Redeploy your service');
+  console.error('');
+  console.error('Railway will automatically set the DATABASE_URL variable.');
+  process.exit(1);
+}
+
 // PostgreSQL connection pool
 // Railway automatically provides DATABASE_URL environment variable
 const pool = new Pool({
@@ -71,6 +85,148 @@ async function initializeDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_participant_id
       ON history_entries(export_id)
+    `);
+
+    // Create SERP data tables
+    // Main SERP export table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_exports (
+        id SERIAL PRIMARY KEY,
+        participant_id VARCHAR(255) NOT NULL,
+        export_timestamp TIMESTAMP NOT NULL,
+        entry_count INTEGER NOT NULL,
+        received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (participant_id) REFERENCES participants(participant_id)
+      )
+    `);
+
+    // Individual SERP sessions
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_sessions (
+        id SERIAL PRIMARY KEY,
+        export_id INTEGER NOT NULL,
+        serp_id VARCHAR(255) NOT NULL,
+        participant_id VARCHAR(255) NOT NULL,
+        visit_start_time TIMESTAMP NOT NULL,
+        query TEXT NOT NULL,
+        hashed_query VARCHAR(255),
+        attribution TEXT,
+        attention_duration INTEGER,
+        max_scroll_depth INTEGER,
+        max_scroll_percentage NUMERIC(5,2),
+        page_height INTEGER,
+        viewport_height INTEGER,
+        ai_overview_top_position INTEGER,
+        ai_overview_bottom_position INTEGER,
+        is_ai_overview_expanded BOOLEAN,
+        ai_overview_initial_height INTEGER,
+        ai_overview_expanded_height INTEGER,
+        dive_deeper_clicked BOOLEAN,
+        dive_deeper_click_timestamp TIMESTAMP,
+        FOREIGN KEY (export_id) REFERENCES serp_exports(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Organic results
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_organic_results (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        title TEXT,
+        top_left_x INTEGER,
+        top_left_y INTEGER,
+        top_right_x INTEGER,
+        top_right_y INTEGER,
+        bottom_left_x INTEGER,
+        bottom_left_y INTEGER,
+        bottom_right_x INTEGER,
+        bottom_right_y INTEGER,
+        FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Ad results
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_ad_results (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        title TEXT,
+        top_left_x INTEGER,
+        top_left_y INTEGER,
+        top_right_x INTEGER,
+        top_right_y INTEGER,
+        bottom_left_x INTEGER,
+        bottom_left_y INTEGER,
+        bottom_right_x INTEGER,
+        bottom_right_y INTEGER,
+        FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Result clicks
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_result_clicks (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        click_timestamp TIMESTAMP NOT NULL,
+        attention_duration_until_click INTEGER,
+        is_page_loaded_upon_selection BOOLEAN,
+        result_ranking INTEGER,
+        FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Ad clicks
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_ad_clicks (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        click_timestamp TIMESTAMP NOT NULL,
+        attention_duration_until_click INTEGER,
+        is_page_loaded_upon_selection BOOLEAN,
+        result_ranking INTEGER,
+        FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    // AI Overview clicks
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_aio_clicks (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        link_text TEXT,
+        click_timestamp TIMESTAMP NOT NULL,
+        attention_duration_until_click INTEGER,
+        is_page_loaded_upon_selection BOOLEAN,
+        redirects_to_google_serp BOOLEAN,
+        FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    // AI Overview links
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS serp_aio_links (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create indexes for SERP tables
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_serp_sessions_export
+      ON serp_sessions(export_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_serp_sessions_participant
+      ON serp_sessions(participant_id)
     `);
 
     console.log('✅ Database tables initialized successfully');
@@ -212,24 +368,279 @@ app.post('/api/export-history', async (req, res) => {
   }
 });
 
+// SERP data export endpoint
+app.post('/api/export-serp', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { participantId, timestamp, serpData } = req.body;
+
+    // Validate required fields
+    if (!participantId || !timestamp || !serpData || typeof serpData !== 'object') {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: participantId, timestamp, serpData'
+      });
+    }
+
+    const serpEntries = Object.entries(serpData);
+    const entryCount = serpEntries.length;
+
+    console.log(`📥 Receiving SERP export from participant: ${participantId}`);
+    console.log(`   SERP sessions: ${entryCount}`);
+    console.log(`   Timestamp: ${timestamp}`);
+
+    // Start transaction
+    await client.query('BEGIN');
+
+    // Insert or update participant
+    await client.query(`
+      INSERT INTO participants (participant_id, last_seen, total_exports)
+      VALUES ($1, CURRENT_TIMESTAMP, 1)
+      ON CONFLICT (participant_id)
+      DO UPDATE SET
+        last_seen = CURRENT_TIMESTAMP,
+        total_exports = participants.total_exports + 1
+    `, [participantId]);
+
+    // Insert SERP export record
+    const exportResult = await client.query(`
+      INSERT INTO serp_exports (participant_id, export_timestamp, entry_count)
+      VALUES ($1, $2, $3)
+      RETURNING id
+    `, [participantId, timestamp, entryCount]);
+
+    const exportId = exportResult.rows[0].id;
+
+    // Insert each SERP session
+    let processedSessions = 0;
+
+    for (const [serpId, session] of serpEntries) {
+      // Insert SERP session
+      const sessionResult = await client.query(`
+        INSERT INTO serp_sessions (
+          export_id, serp_id, participant_id, visit_start_time, query, hashed_query,
+          attribution, attention_duration, max_scroll_depth, max_scroll_percentage,
+          page_height, viewport_height, ai_overview_top_position, ai_overview_bottom_position,
+          is_ai_overview_expanded, ai_overview_initial_height, ai_overview_expanded_height,
+          dive_deeper_clicked, dive_deeper_click_timestamp
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        RETURNING id
+      `, [
+        exportId,
+        serpId,
+        session.participantId || participantId,
+        session.visitStartTime,
+        session.query,
+        session.hashedQuery || null,
+        session.attribution || null,
+        session.attentionDuration || null,
+        session.maxScrollDepth || null,
+        session.maxScrollPercentage || null,
+        session.pageHeight || null,
+        session.viewportHeight || null,
+        session.aiOverviewTopPosition || null,
+        session.aiOverviewBottomPosition || null,
+        session.isAiOverviewExpanded || null,
+        session.aiOverviewInitialHeight || null,
+        session.aiOverviewExpandedHeight || null,
+        session.diveDeeperClicked || null,
+        session.diveDeeperClickTimestamp || null
+      ]);
+
+      const sessionId = sessionResult.rows[0].id;
+
+      // Insert organic results
+      if (session.organicResults && Array.isArray(session.organicResults)) {
+        for (const result of session.organicResults) {
+          await client.query(`
+            INSERT INTO serp_organic_results (
+              session_id, url, title, top_left_x, top_left_y, top_right_x, top_right_y,
+              bottom_left_x, bottom_left_y, bottom_right_x, bottom_right_y
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          `, [
+            sessionId,
+            result.url,
+            result.title || null,
+            result.topLeft?.x || null,
+            result.topLeft?.y || null,
+            result.topRight?.x || null,
+            result.topRight?.y || null,
+            result.bottomLeft?.x || null,
+            result.bottomLeft?.y || null,
+            result.bottomRight?.x || null,
+            result.bottomRight?.y || null
+          ]);
+        }
+      }
+
+      // Insert ad results
+      if (session.adResults && Array.isArray(session.adResults)) {
+        for (const ad of session.adResults) {
+          await client.query(`
+            INSERT INTO serp_ad_results (
+              session_id, url, title, top_left_x, top_left_y, top_right_x, top_right_y,
+              bottom_left_x, bottom_left_y, bottom_right_x, bottom_right_y
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          `, [
+            sessionId,
+            ad.url,
+            ad.title || null,
+            ad.topLeft?.x || null,
+            ad.topLeft?.y || null,
+            ad.topRight?.x || null,
+            ad.topRight?.y || null,
+            ad.bottomLeft?.x || null,
+            ad.bottomLeft?.y || null,
+            ad.bottomRight?.x || null,
+            ad.bottomRight?.y || null
+          ]);
+        }
+      }
+
+      // Insert result clicks
+      if (session.resultClicks && Array.isArray(session.resultClicks)) {
+        for (const click of session.resultClicks) {
+          await client.query(`
+            INSERT INTO serp_result_clicks (
+              session_id, url, click_timestamp, attention_duration_until_click,
+              is_page_loaded_upon_selection, result_ranking
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+          `, [
+            sessionId,
+            click.url,
+            click.timestamp,
+            click.attentionDurationUntilClick || null,
+            click.isPageLoadedUponSelection || null,
+            click.resultRanking || null
+          ]);
+        }
+      }
+
+      // Insert ad clicks
+      if (session.adClicks && Array.isArray(session.adClicks)) {
+        for (const click of session.adClicks) {
+          await client.query(`
+            INSERT INTO serp_ad_clicks (
+              session_id, url, click_timestamp, attention_duration_until_click,
+              is_page_loaded_upon_selection, result_ranking
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+          `, [
+            sessionId,
+            click.url,
+            click.timestamp,
+            click.attentionDurationUntilClick || null,
+            click.isPageLoadedUponSelection || null,
+            click.resultRanking || null
+          ]);
+        }
+      }
+
+      // Insert AI Overview clicks
+      if (session.aiOverviewClicks && Array.isArray(session.aiOverviewClicks)) {
+        for (const click of session.aiOverviewClicks) {
+          await client.query(`
+            INSERT INTO serp_aio_clicks (
+              session_id, url, link_text, click_timestamp, attention_duration_until_click,
+              is_page_loaded_upon_selection, redirects_to_google_serp
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `, [
+            sessionId,
+            click.url,
+            click.linkText || null,
+            click.timestamp,
+            click.attentionDurationUntilClick || null,
+            click.isPageLoadedUponSelection || null,
+            click.redirectsToGoogleSERP || null
+          ]);
+        }
+      }
+
+      // Insert AI Overview links
+      if (session.aiOverviewLinks && Array.isArray(session.aiOverviewLinks)) {
+        for (const link of session.aiOverviewLinks) {
+          await client.query(`
+            INSERT INTO serp_aio_links (session_id, url)
+            VALUES ($1, $2)
+          `, [sessionId, link]);
+        }
+      }
+
+      processedSessions++;
+      if (processedSessions % 10 === 0) {
+        console.log(`   Processed ${processedSessions}/${entryCount} sessions...`);
+      }
+    }
+
+    // Commit transaction
+    await client.query('COMMIT');
+
+    console.log(`✅ Successfully stored ${processedSessions} SERP sessions from ${participantId}`);
+
+    res.json({
+      success: true,
+      message: `Successfully stored ${processedSessions} SERP sessions`,
+      exportId: exportId
+    });
+
+  } catch (error) {
+    // Rollback transaction on error
+    await client.query('ROLLBACK');
+
+    console.error('❌ Error processing SERP export:', error);
+
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error processing SERP export'
+    });
+  } finally {
+    client.release();
+  }
+});
+
 // Get statistics endpoint (optional, for admin viewing)
 app.get('/api/stats', async (req, res) => {
   try {
     const participantCount = await pool.query('SELECT COUNT(DISTINCT participant_id) as count FROM participants');
-    const exportCount = await pool.query('SELECT COUNT(*) as count FROM history_exports');
-    const entryCount = await pool.query('SELECT COUNT(*) as count FROM history_entries');
-    const recentExports = await pool.query(`
+
+    // History stats
+    const historyExportCount = await pool.query('SELECT COUNT(*) as count FROM history_exports');
+    const historyEntryCount = await pool.query('SELECT COUNT(*) as count FROM history_entries');
+    const recentHistoryExports = await pool.query(`
       SELECT participant_id, export_timestamp, entry_count
       FROM history_exports
       ORDER BY received_at DESC
-      LIMIT 10
+      LIMIT 5
+    `);
+
+    // SERP stats
+    const serpExportCount = await pool.query('SELECT COUNT(*) as count FROM serp_exports');
+    const serpSessionCount = await pool.query('SELECT COUNT(*) as count FROM serp_sessions');
+    const recentSerpExports = await pool.query(`
+      SELECT participant_id, export_timestamp, entry_count
+      FROM serp_exports
+      ORDER BY received_at DESC
+      LIMIT 5
     `);
 
     res.json({
       participants: parseInt(participantCount.rows[0].count),
-      totalExports: parseInt(exportCount.rows[0].count),
-      totalEntries: parseInt(entryCount.rows[0].count),
-      recentExports: recentExports.rows
+      history: {
+        totalExports: parseInt(historyExportCount.rows[0].count),
+        totalEntries: parseInt(historyEntryCount.rows[0].count),
+        recentExports: recentHistoryExports.rows
+      },
+      serp: {
+        totalExports: parseInt(serpExportCount.rows[0].count),
+        totalSessions: parseInt(serpSessionCount.rows[0].count),
+        recentExports: recentSerpExports.rows
+      }
     });
   } catch (error) {
     console.error('Error fetching stats:', error);
