@@ -112,15 +112,15 @@ async function initializeDatabase() {
         hashed_query VARCHAR(255),
         attribution TEXT,
         attention_duration INTEGER,
-        max_scroll_depth INTEGER,
+        max_scroll_depth NUMERIC(10,2),
         max_scroll_percentage NUMERIC(5,2),
-        page_height INTEGER,
-        viewport_height INTEGER,
-        ai_overview_top_position INTEGER,
-        ai_overview_bottom_position INTEGER,
+        page_height NUMERIC(10,2),
+        viewport_height NUMERIC(10,2),
+        ai_overview_top_position NUMERIC(10,2),
+        ai_overview_bottom_position NUMERIC(10,2),
         is_ai_overview_expanded BOOLEAN,
-        ai_overview_initial_height INTEGER,
-        ai_overview_expanded_height INTEGER,
+        ai_overview_initial_height NUMERIC(10,2),
+        ai_overview_expanded_height NUMERIC(10,2),
         dive_deeper_clicked BOOLEAN,
         dive_deeper_click_timestamp TIMESTAMP,
         FOREIGN KEY (export_id) REFERENCES serp_exports(id) ON DELETE CASCADE
@@ -134,14 +134,14 @@ async function initializeDatabase() {
         session_id INTEGER NOT NULL,
         url TEXT NOT NULL,
         title TEXT,
-        top_left_x INTEGER,
-        top_left_y INTEGER,
-        top_right_x INTEGER,
-        top_right_y INTEGER,
-        bottom_left_x INTEGER,
-        bottom_left_y INTEGER,
-        bottom_right_x INTEGER,
-        bottom_right_y INTEGER,
+        top_left_x NUMERIC(10,2),
+        top_left_y NUMERIC(10,2),
+        top_right_x NUMERIC(10,2),
+        top_right_y NUMERIC(10,2),
+        bottom_left_x NUMERIC(10,2),
+        bottom_left_y NUMERIC(10,2),
+        bottom_right_x NUMERIC(10,2),
+        bottom_right_y NUMERIC(10,2),
         FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
       )
     `);
@@ -153,14 +153,14 @@ async function initializeDatabase() {
         session_id INTEGER NOT NULL,
         url TEXT NOT NULL,
         title TEXT,
-        top_left_x INTEGER,
-        top_left_y INTEGER,
-        top_right_x INTEGER,
-        top_right_y INTEGER,
-        bottom_left_x INTEGER,
-        bottom_left_y INTEGER,
-        bottom_right_x INTEGER,
-        bottom_right_y INTEGER,
+        top_left_x NUMERIC(10,2),
+        top_left_y NUMERIC(10,2),
+        top_right_x NUMERIC(10,2),
+        top_right_y NUMERIC(10,2),
+        bottom_left_x NUMERIC(10,2),
+        bottom_left_y NUMERIC(10,2),
+        bottom_right_x NUMERIC(10,2),
+        bottom_right_y NUMERIC(10,2),
         FOREIGN KEY (session_id) REFERENCES serp_sessions(id) ON DELETE CASCADE
       )
     `);
@@ -228,6 +228,67 @@ async function initializeDatabase() {
       CREATE INDEX IF NOT EXISTS idx_serp_sessions_participant
       ON serp_sessions(participant_id)
     `);
+
+    // Migration: Convert INTEGER columns to NUMERIC for decimal support
+    // Check if serp_sessions table exists and has INTEGER columns
+    const checkSerpSessions = await client.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_name = 'serp_sessions'
+      AND column_name IN ('max_scroll_depth', 'page_height', 'viewport_height', 'ai_overview_top_position',
+                          'ai_overview_bottom_position', 'ai_overview_initial_height', 'ai_overview_expanded_height')
+      AND data_type = 'integer'
+    `);
+
+    if (checkSerpSessions.rows.length > 0) {
+      console.log('🔄 Migrating serp_sessions columns from INTEGER to NUMERIC...');
+      const columnsToMigrate = ['max_scroll_depth', 'page_height', 'viewport_height', 'ai_overview_top_position',
+                                'ai_overview_bottom_position', 'ai_overview_initial_height', 'ai_overview_expanded_height'];
+      for (const col of columnsToMigrate) {
+        await client.query(`ALTER TABLE serp_sessions ALTER COLUMN ${col} TYPE NUMERIC(10,2)`);
+      }
+      console.log('✅ Migrated serp_sessions columns');
+    }
+
+    // Migration: Convert position columns in organic_results
+    const checkOrganic = await client.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'serp_organic_results'
+      AND column_name LIKE '%_x' OR column_name LIKE '%_y'
+      AND data_type = 'integer'
+      LIMIT 1
+    `);
+
+    if (checkOrganic.rows.length > 0) {
+      console.log('🔄 Migrating serp_organic_results columns from INTEGER to NUMERIC...');
+      const positionCols = ['top_left_x', 'top_left_y', 'top_right_x', 'top_right_y',
+                           'bottom_left_x', 'bottom_left_y', 'bottom_right_x', 'bottom_right_y'];
+      for (const col of positionCols) {
+        await client.query(`ALTER TABLE serp_organic_results ALTER COLUMN ${col} TYPE NUMERIC(10,2)`);
+      }
+      console.log('✅ Migrated serp_organic_results columns');
+    }
+
+    // Migration: Convert position columns in ad_results
+    const checkAds = await client.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'serp_ad_results'
+      AND column_name LIKE '%_x' OR column_name LIKE '%_y'
+      AND data_type = 'integer'
+      LIMIT 1
+    `);
+
+    if (checkAds.rows.length > 0) {
+      console.log('🔄 Migrating serp_ad_results columns from INTEGER to NUMERIC...');
+      const positionCols = ['top_left_x', 'top_left_y', 'top_right_x', 'top_right_y',
+                           'bottom_left_x', 'bottom_left_y', 'bottom_right_x', 'bottom_right_y'];
+      for (const col of positionCols) {
+        await client.query(`ALTER TABLE serp_ad_results ALTER COLUMN ${col} TYPE NUMERIC(10,2)`);
+      }
+      console.log('✅ Migrated serp_ad_results columns');
+    }
 
     console.log('✅ Database tables initialized successfully');
   } catch (error) {
@@ -416,8 +477,13 @@ app.post('/api/export-serp', async (req, res) => {
     let processedSessions = 0;
 
     for (const [serpId, session] of serpEntries) {
-      // Insert SERP session
-      const sessionResult = await client.query(`
+      try {
+        console.log(`   Processing SERP session: ${serpId}`);
+        console.log(`   Query: ${session.query}`);
+        console.log(`   Visit time: ${session.visitStartTime}`);
+
+        // Insert SERP session
+        const sessionResult = await client.query(`
         INSERT INTO serp_sessions (
           export_id, serp_id, participant_id, visit_start_time, query, hashed_query,
           attribution, attention_duration, max_scroll_depth, max_scroll_percentage,
@@ -572,9 +638,14 @@ app.post('/api/export-serp', async (req, res) => {
         }
       }
 
-      processedSessions++;
-      if (processedSessions % 10 === 0) {
-        console.log(`   Processed ${processedSessions}/${entryCount} sessions...`);
+        processedSessions++;
+        if (processedSessions % 10 === 0) {
+          console.log(`   Processed ${processedSessions}/${entryCount} sessions...`);
+        }
+      } catch (sessionError) {
+        console.error(`   ❌ Error processing session ${serpId}:`, sessionError);
+        console.error(`   Session data:`, JSON.stringify(session, null, 2));
+        throw sessionError; // Re-throw to rollback transaction
       }
     }
 
@@ -594,10 +665,18 @@ app.post('/api/export-serp', async (req, res) => {
     await client.query('ROLLBACK');
 
     console.error('❌ Error processing SERP export:', error);
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      hint: error.hint,
+      position: error.position
+    });
 
     res.status(500).json({
       success: false,
-      error: 'Internal server error processing SERP export'
+      error: 'Internal server error processing SERP export',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   } finally {
     client.release();
